@@ -51,6 +51,7 @@ public class Main extends JFrame {
     private final JTextArea fullTextArea;
     private final JTextField searchField;
     private final JButton clearSearchButton;
+    private final JComboBox<String> datasetView;
     private final TableRowSorter<DefaultTableModel> sorter;
 
     private final JButton importButton;
@@ -74,6 +75,8 @@ public class Main extends JFrame {
 
     private final Map<Integer, String> textByRow = new HashMap<>();
     private final Map<Integer, String> dateByRow = new HashMap<>();
+    private final Map<String, List<String[]>> datasets = new HashMap<>();
+    private boolean switchingDatasetView;
 
     private static final List<String> STOP_WORDS = Arrays.asList(
         "the", "a", "an", "and", "or", "but", "if", "then",
@@ -106,7 +109,7 @@ public class Main extends JFrame {
         setLayout(new BorderLayout(8, 8));
 
         model = new DefaultTableModel(
-            new String[]{"ID", "Title", "Category", "Created At"}, 0
+            new String[]{"ID", "Title", "Category", "Created At", "Source", "Probability"}, 0
         ) {
             @Override
             public boolean isCellEditable(int row, int column) {
@@ -179,10 +182,13 @@ public class Main extends JFrame {
         buttonPanel.add(temporalStabilityButton);
 
         searchField = new JTextField(28);
-        searchField.setToolTipText("Search ID, title, category, date, or full post text");
+        searchField.setToolTipText("Search ID, title, category, date, source, probability, or full post text");
         clearSearchButton = new JButton("Clear Search");
+        datasetView = new JComboBox<>(new String[]{"Dark", "Surface", "Combined"});
 
         JPanel searchPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        searchPanel.add(new JLabel("Dataset view:"));
+        searchPanel.add(datasetView);
         searchPanel.add(new JLabel("Search records:"));
         searchPanel.add(searchField);
         searchPanel.add(clearSearchButton);
@@ -191,13 +197,18 @@ public class Main extends JFrame {
         topPanel.add(buttonPanel, BorderLayout.CENTER);
         topPanel.add(searchPanel, BorderLayout.SOUTH);
 
-        statusLabel = new JLabel("Please import a CSV dataset.");
+        statusLabel = new JLabel("Loading bundled Dark and Surface datasets...");
 
         add(topPanel, BorderLayout.NORTH);
         add(splitPane, BorderLayout.CENTER);
         add(statusLabel, BorderLayout.SOUTH);
 
         importButton.addActionListener(e -> importDataset());
+        datasetView.addActionListener(e -> {
+            if (!switchingDatasetView && !datasets.isEmpty()) {
+                showDatasetView((String) datasetView.getSelectedItem());
+            }
+        });
         analyzeButton.addActionListener(e -> analyzeData());
         analyzeTextButton.addActionListener(e -> analyzeSelectedText());
         preprocessButton.addActionListener(e -> preprocessSelectedText());
@@ -242,6 +253,7 @@ public class Main extends JFrame {
                 }
             }
         );
+        loadBundledDatasets();
     }
 
     private void filterRecords() {
@@ -279,6 +291,124 @@ public class Main extends JFrame {
         } else if (table.getSelectedRow() == -1) {
             table.setRowSelectionInterval(0, 0);
         }
+    }
+
+    private File findDatasetFile(String name) {
+        File workingDirectory = new File(System.getProperty("user.dir"));
+        File[] candidates = {
+            new File(workingDirectory, "data/" + name),
+            new File(workingDirectory, "datasets/" + name),
+            new File(workingDirectory, "Dataset/Labeled Dataset of Cybersecurity Events from Dark/" + name),
+            new File(workingDirectory, "../../Dataset/Labeled Dataset of Cybersecurity Events from Dark/" + name),
+            new File(workingDirectory, name),
+            new File(workingDirectory, "../data/" + name)
+        };
+        for (File candidate : candidates) {
+            if (candidate.isFile()) return candidate;
+        }
+        return candidates[0];
+    }
+
+    private void loadBundledDatasets() {
+        File darkFile = findDatasetFile("base_dark_final.csv");
+        File surfaceFile = findDatasetFile("base_surface_final.csv");
+        if (!darkFile.isFile() || !surfaceFile.isFile()) {
+            statusLabel.setText("Place both CSV files in the project data folder, then restart.");
+            return;
+        }
+
+        importButton.setEnabled(false);
+        new SwingWorker<Map<String, List<String[]>>, Void>() {
+            @Override
+            protected Map<String, List<String[]>> doInBackground() throws Exception {
+                Map<String, List<String[]>> loaded = new HashMap<>();
+                loaded.put("Dark", readDataset(darkFile, "Dark"));
+                loaded.put("Surface", readDataset(surfaceFile, "Surface"));
+                List<String[]> combined = new ArrayList<>(loaded.get("Dark"));
+                combined.addAll(loaded.get("Surface"));
+                loaded.put("Combined", combined);
+                return loaded;
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    datasets.putAll(get());
+                    showDatasetView("Dark");
+                    statusLabel.setText("Loaded Dark (" + datasets.get("Dark").size()
+                        + "), Surface (" + datasets.get("Surface").size()
+                        + "), and Combined (" + datasets.get("Combined").size() + ") records.");
+                } catch (Exception ex) {
+                    statusLabel.setText("Automatic dataset loading failed; use Import Dataset.");
+                    JOptionPane.showMessageDialog(Main.this,
+                        "Could not load both CSV files from " + darkFile.getParent()
+                        + ":\n" + ex.getMessage(), "Dataset Load Error", JOptionPane.ERROR_MESSAGE);
+                } finally {
+                    importButton.setEnabled(true);
+                }
+            }
+        }.execute();
+    }
+
+    private List<String[]> readDataset(File file, String source) throws IOException {
+        List<String[]> rows = new ArrayList<>();
+        try (java.io.Reader reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8);
+             CSVParser parser = CSVFormat.DEFAULT.builder()
+                 .setHeader().setSkipHeaderRecord(true).get().parse(reader)) {
+            Map<String, Integer> headers = parser.getHeaderMap();
+            for (CSVRecord record : parser) {
+                String probability = getField(record, headers, "probability");
+                if (!probability.isBlank()) {
+                    String normalized = probability.trim().replace(',', '.');
+                    try {
+                        Double.parseDouble(normalized);
+                    } catch (NumberFormatException ex) {
+                        throw new IOException("Invalid probability at CSV row "
+                            + (record.getRecordNumber() + 1) + " in " + file.getName()
+                            + ": " + probability, ex);
+                    }
+                }
+                rows.add(new String[]{
+                    getField(record, headers, "id"),
+                    getField(record, headers, "title"),
+                    getField(record, headers, "category"),
+                    getField(record, headers, "created_at"),
+                    getField(record, headers, "full_text"),
+                    source,
+                    probability
+                });
+            }
+        }
+        return rows;
+    }
+
+    private void showDatasetView(String view) {
+        List<String[]> rows = datasets.get(view);
+        if (rows == null) return;
+        loadRowsIntoTable(rows);
+        statusLabel.setText("Showing " + view + ": " + rows.size() + " records.");
+    }
+
+    private void loadRowsIntoTable(List<String[]> rows) {
+        searchField.setText("");
+        model.setRowCount(0);
+        textByRow.clear();
+        dateByRow.clear();
+        fullTextArea.setText("");
+        for (String[] row : rows) {
+            int rowIndex = model.getRowCount();
+            model.addRow(new Object[]{row[0], row[1], row[2], row[3], row[5], row[6]});
+            textByRow.put(rowIndex, row[4]);
+            dateByRow.put(rowIndex, row[3]);
+        }
+        boolean hasRows = !rows.isEmpty();
+        analyzeButton.setEnabled(hasRows);
+        temporalButton.setEnabled(hasRows);
+        chartButton.setEnabled(hasRows);
+        exportButton.setEnabled(hasRows);
+        clusteringButton.setEnabled(hasRows);
+        setAnalysisButtons(false);
+        if (hasRows) table.setRowSelectionInterval(0, 0);
     }
 
     private void importDataset() {
@@ -324,7 +454,9 @@ public class Main extends JFrame {
                             getField(record, headers, "title"),
                             getField(record, headers, "category"),
                             getField(record, headers, "created_at"),
-                            getField(record, headers, "full_text")
+                            getField(record, headers, "full_text"),
+                            "Imported",
+                            getField(record, headers, "probability")
                         });
                     }
                 }
@@ -337,28 +469,7 @@ public class Main extends JFrame {
                 try {
                     List<String[]> rows = get();
 
-                    searchField.setText("");
-                    model.setRowCount(0);
-                    textByRow.clear();
-                    dateByRow.clear();
-                    fullTextArea.setText("");
-
-                    for (String[] row : rows) {
-                        int rowIndex = model.getRowCount();
-
-                        model.addRow(new Object[]{
-                            row[0], row[1], row[2], row[3]
-                        });
-
-                        textByRow.put(rowIndex, row[4]);
-                        dateByRow.put(rowIndex, row[3]);
-                    }
-
-                    analyzeButton.setEnabled(!rows.isEmpty());
-                    temporalButton.setEnabled(!rows.isEmpty());
-                    chartButton.setEnabled(!rows.isEmpty());
-                    exportButton.setEnabled(!rows.isEmpty());
-                    clusteringButton.setEnabled(!rows.isEmpty());
+                    loadRowsIntoTable(rows);
 
                     statusLabel.setText(
                         "Loaded " + rows.size() + " records from "
@@ -395,7 +506,7 @@ public class Main extends JFrame {
         for (String header : headers.keySet()) {
             if (header.trim().equalsIgnoreCase(fieldName)) {
                 String value = record.get(header);
-                return value == null ? "" : value.trim();
+                return value == null ? "" : value;
             }
         }
         return "";
@@ -417,6 +528,8 @@ public class Main extends JFrame {
             + "\nTitle: " + model.getValueAt(row, 1)
             + "\nCategory: " + model.getValueAt(row, 2)
             + "\nCreated At: " + model.getValueAt(row, 3)
+            + "\nSource: " + model.getValueAt(row, 4)
+            + "\nProbability: " + model.getValueAt(row, 5)
             + "\n\nFull Text:\n" + text
         );
 
